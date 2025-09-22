@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, Depends
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime
 import pytz
@@ -27,8 +27,6 @@ class ProjectDB(Base):
     description = Column(String, nullable=True)
     status = Column(String, default="Planned")
     workers = relationship("WorkerDB", back_populates="project")
-    # Add relationship for get_clock_entries to work
-    clock_entries = relationship("ClockEntryDB", back_populates="project")
 
 class WorkerDB(Base):
     __tablename__ = "workers"
@@ -48,15 +46,26 @@ class ClockEntryDB(Base):
     clock_out_time = Column(DateTime, nullable=True)
     total_hours = Column(Float, nullable=True)
     worker = relationship("WorkerDB", back_populates="clock_entries")
-    # Add relationship for get_clock_entries to work
-    project = relationship("ProjectDB", back_populates="clock_entries")
 
 class UserDB(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String, unique=True, index=True)
-    password = Column(String)
+    password = Column(String) 
     role = Column(String)
+
+# --- NEW QUERY MODEL ---
+class QueryDB(Base):
+    __tablename__ = "queries"
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String, index=True)
+    description = Column(Text)
+    worker_name = Column(String)
+    project_name = Column(String)
+    priority = Column(String, default="medium")
+    status = Column(String, default="open")
+    created_at = Column(DateTime, default=lambda: datetime.now(ist))
+
 
 Base.metadata.create_all(bind=engine)
 
@@ -89,22 +98,22 @@ class AssignRequest(BaseModel):
 class ClockInRequest(BaseModel):
     worker_id: int
     project_id: int
-    timestamp: Optional[str] = None
+    timestamp: Optional[datetime] = None
 
 class ClockOutRequest(BaseModel):
     worker_id: int
     project_id: int
-    timestamp: Optional[str] = None
+    timestamp: Optional[datetime] = None
 
-class ClockEntryResponse(BaseModel):
+class ClockEntry(BaseModel):
     id: int
     worker_id: int
     project_id: int
-    worker_name: str
-    project_name: str
     clock_in_time: datetime
     clock_out_time: Optional[datetime] = None
     total_hours: Optional[float] = None
+    class Config:
+        orm_mode = True
 
 class LoginRequest(BaseModel):
     username: str
@@ -117,13 +126,26 @@ class User(BaseModel):
     class Config:
         orm_mode = True
 
-class ChatRequest(BaseModel):
-    query: str
+# --- NEW QUERY PYDANTIC MODELS ---
+class QueryBase(BaseModel):
+    title: str
+    description: str
+    worker_name: str
+    project_name: str
+    priority: str
+
+class Query(QueryBase):
+    id: int
+    status: str
+    created_at: datetime
+    class Config:
+        orm_mode = True
 
 # -------------------------------
 # FASTAPI SETUP
 # -------------------------------
 app = FastAPI()
+
 from fastapi.middleware.cors import CORSMiddleware
 app.add_middleware(
     CORSMiddleware,
@@ -140,9 +162,6 @@ def get_db():
     finally:
         db.close()
 
-# -------------------------------
-# SEED USERS
-# -------------------------------
 def seed_users():
     db = SessionLocal()
     if db.query(UserDB).count() == 0:
@@ -163,18 +182,13 @@ seed_users()
 def root():
     return {"message": "Backend running successfully"}
 
-# ---------- LOGIN ----------
 @app.post("/login", response_model=User)
 def login(request: LoginRequest, db: Session = Depends(get_db)):
-    user = db.query(UserDB).filter(
-        UserDB.username == request.username,
-        UserDB.password == request.password
-    ).first()
+    user = db.query(UserDB).filter(UserDB.username == request.username, UserDB.password == request.password).first()
     if not user:
         raise HTTPException(status_code=401, detail="Invalid credentials")
     return user
 
-# ---------- PROJECTS ----------
 @app.post("/projects/", response_model=Project)
 def create_project(project: ProjectBase, db: Session = Depends(get_db)):
     new_project = ProjectDB(**project.dict())
@@ -190,7 +204,6 @@ def get_projects(status: Optional[str] = None, db: Session = Depends(get_db)):
         query = query.filter(ProjectDB.status.ilike(status))
     return query.all()
 
-# ---------- WORKERS ----------
 @app.post("/workers/", response_model=Worker)
 def create_worker(worker: WorkerBase, db: Session = Depends(get_db)):
     new_worker = WorkerDB(**worker.dict())
@@ -216,114 +229,68 @@ def assign_worker(project_id: int, request: AssignRequest, db: Session = Depends
     db.commit()
     return {"message": f"Worker {worker.name} assigned to project {project.name}"}
 
-# ---------- CLOCK ----------
-@app.post("/clockin/")
+@app.post("/clockin/", response_model=ClockEntry)
 def clock_in(request: ClockInRequest, db: Session = Depends(get_db)):
     worker = db.query(WorkerDB).filter(WorkerDB.id == request.worker_id).first()
     project = db.query(ProjectDB).filter(ProjectDB.id == request.project_id).first()
     if not worker or not project:
         raise HTTPException(status_code=404, detail="Worker or Project not found")
     
-    active = db.query(ClockEntryDB).filter(ClockEntryDB.worker_id == worker.id, ClockEntryDB.clock_out_time == None).first()
+    active = db.query(ClockEntryDB).filter(
+        ClockEntryDB.worker_id == worker.id,
+        ClockEntryDB.clock_out_time == None
+    ).first()
+    
     if active:
-        raise HTTPException(status_code=400, detail=f"Worker already clocked in on project {active.project_id}")
+        raise HTTPException(status_code=400, detail=f"Worker already clocked in on Project ID {active.project_id}")
 
-    if request.timestamp:
-        ts_str = request.timestamp.replace("Z", "+00:00")
-        clock_in_time = datetime.fromisoformat(ts_str)
-    else:
-        clock_in_time = datetime.now(ist)
-
-    entry = ClockEntryDB(worker_id=worker.id, project_id=project.id, clock_in_time=clock_in_time)
+    clock_time = request.timestamp if request.timestamp else datetime.now(ist)
+    entry = ClockEntryDB(worker_id=worker.id, project_id=project.id, clock_in_time=clock_time)
     db.add(entry)
     db.commit()
     db.refresh(entry)
     return entry
 
-@app.post("/clockout/")
+@app.post("/clockout/", response_model=ClockEntry)
 def clock_out(request: ClockOutRequest, db: Session = Depends(get_db)):
     entry = db.query(ClockEntryDB).filter(
         ClockEntryDB.worker_id == request.worker_id,
-        ClockEntryDB.project_id == request.project_id,
         ClockEntryDB.clock_out_time == None
     ).order_by(ClockEntryDB.id.desc()).first()
-    
+
     if not entry:
-        raise HTTPException(status_code=400, detail="No active clock-in found for this worker on this project")
+        raise HTTPException(status_code=400, detail="No active clock-in found for this worker")
 
-    if request.timestamp:
-        ts_str = request.timestamp.replace("Z", "+00:00")
-        clock_out_time = datetime.fromisoformat(ts_str)
-    else:
-        clock_out_time = datetime.now(ist)
-
-    clock_in_time = entry.clock_in_time
-    if clock_in_time.tzinfo is None:
-        clock_in_time = ist.localize(clock_in_time)
-    if clock_out_time.tzinfo is None:
-        clock_out_time = ist.localize(clock_out_time)
-
+    clock_out_time = request.timestamp if request.timestamp else datetime.now(ist)
     entry.clock_out_time = clock_out_time
-    entry.total_hours = round((clock_out_time - clock_in_time).total_seconds() / 3600, 2)
+    
+    # Ensure timezone awareness for calculation
+    clock_in_aware = entry.clock_in_time.astimezone(ist) if entry.clock_in_time.tzinfo is None else entry.clock_in_time
+    clock_out_aware = clock_out_time.astimezone(ist) if clock_out_time.tzinfo is None else clock_out_time
+
+    entry.total_hours = round((clock_out_aware - clock_in_aware).total_seconds() / 3600, 2)
     db.commit()
     db.refresh(entry)
     return entry
 
-@app.get("/clock_entries/", response_model=List[ClockEntryResponse])
+@app.get("/clock_entries/", response_model=List[ClockEntry])
 def get_clock_entries(worker_id: Optional[int] = None, project_id: Optional[int] = None, db: Session = Depends(get_db)):
     query = db.query(ClockEntryDB)
     if worker_id:
         query = query.filter(ClockEntryDB.worker_id == worker_id)
     if project_id:
         query = query.filter(ClockEntryDB.project_id == project_id)
-    
-    entries_from_db = query.order_by(ClockEntryDB.clock_in_time.desc()).all()
-    
-    response = []
-    for entry in entries_from_db:
-        response.append({
-            "id": entry.id,
-            "worker_id": entry.worker_id,
-            "project_id": entry.project_id,
-            "worker_name": entry.worker.name,
-            "project_name": entry.project.name,
-            "clock_in_time": entry.clock_in_time,
-            "clock_out_time": entry.clock_out_time,
-            "total_hours": entry.total_hours
-        })
-    return response
+    return query.all()
 
-# ---------- CHATBOT ----------
-@app.post("/chatbot")
-def chatbot(request: ChatRequest, db: Session = Depends(get_db)):
-    q = request.query.lower().strip()
-    response = ""
+# --- NEW QUERIES ENDPOINTS ---
+@app.post("/queries/", response_model=Query)
+def create_query(query: QueryBase, db: Session = Depends(get_db)):
+    new_query = QueryDB(**query.dict())
+    db.add(new_query)
+    db.commit()
+    db.refresh(new_query)
+    return new_query
 
-    worker = db.query(WorkerDB).filter(WorkerDB.name.ilike(f"%{q}%")).first()
-    project = db.query(ProjectDB).filter(ProjectDB.name.ilike(f"%{q}%")).first()
-
-    if worker:
-        response += f"👷 Worker: {worker.name} (Role: {worker.role})\n"
-        if worker.project:
-            response += f"Assigned Project: {worker.project.name}\n"
-        entries = db.query(ClockEntryDB).filter(ClockEntryDB.worker_id == worker.id).all()
-        if entries:
-            response += "Clock Entries:\n"
-            for e in entries:
-                proj_name = db.query(ProjectDB).filter(ProjectDB.id == e.project_id).first().name
-                response += f"- Project {proj_name}: In {e.clock_in_time.strftime('%Y-%m-%d %H:%M')}, Out {e.clock_out_time.strftime('%Y-%m-%d %H:%M') if e.clock_out_time else 'In progress'}\n"
-        else:
-            response += "No clock entries yet.\n"
-    elif project:
-        response += f"📁 Project: {project.name}\n"
-        workers = db.query(WorkerDB).filter(WorkerDB.assigned_project_id == project.id).all()
-        if workers:
-            response += "Workers:\n"
-            for w in workers:
-                response += f"- {w.name} ({w.role})\n"
-        else:
-            response += "No workers assigned.\n"
-    else:
-        response = "❓ No worker or project found matching query."
-
-    return {"response": response}
+@app.get("/queries/", response_model=List[Query])
+def get_queries(db: Session = Depends(get_db)):
+    return db.query(QueryDB).order_by(QueryDB.created_at.desc()).all()
