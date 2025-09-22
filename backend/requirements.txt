@@ -4,3 +4,4 @@ pytz
 sqlalchemy
 aiosqlite
 axios
+headlessui/react
