@@ -1,7 +1,8 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { login } from "../api";
-import { motion } from "framer-motion";
+import { motion, AnimatePresence } from "framer-motion";
+
 import { User, Lock, LogIn, AlertCircle } from "lucide-react";
 
 // --- Animated Background (consistent with Dashboard) ---
